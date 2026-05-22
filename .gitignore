@@ -4,3 +4,4 @@
 /.vscode
 /spotify2tidal.py.old
 /tidal_session.json
+/*.log

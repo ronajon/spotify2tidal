@@ -13,12 +13,15 @@ Requirements:
 
 Usage:
     python spotify_to_tidal.py <spotify_playlist_id> <tidal_playlist_id> [--dry-run]
+                               [--logtoscreen | --logtofile | --lognone]
 """
 
 import argparse
 import json
+import logging
 import os
 import pathlib
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -34,6 +37,7 @@ load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_ID    = os.getenv("TELEGRAM_ID", "")
 SESSION_FILE   = pathlib.Path("tidal_session.json")
+LOG_FILE       = pathlib.Path("spotify_to_tidal.log")
 
 # ── ARGS ──────────────────────────────────────────────────────────────────────
 
@@ -54,12 +58,47 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Preview which tracks would be added without modifying Tidal.",
     )
+
+    log_group = parser.add_mutually_exclusive_group()
+    log_group.add_argument(
+        "--logtoscreen",
+        action="store_true",
+        default=True,
+        help="Print log output to the screen (default).",
+    )
+    log_group.add_argument(
+        "--logtofile",
+        action="store_true",
+        help=f"Write log output to {LOG_FILE}.",
+    )
+    log_group.add_argument(
+        "--lognone",
+        action="store_true",
+        help="Suppress all log output.",
+    )
     return parser.parse_args()
 
 # ── LOGGING ───────────────────────────────────────────────────────────────────
 
+logger = logging.getLogger("spotify_to_tidal")
+
+def setup_logging(args: argparse.Namespace) -> None:
+    logger.setLevel(logging.INFO)
+    fmt = logging.Formatter("%(message)s")
+
+    if args.lognone:
+        logger.addHandler(logging.NullHandler())
+    elif args.logtofile:
+        handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
+        handler.setFormatter(fmt)
+        logger.addHandler(handler)
+    else:  # --logtoscreen (default)
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setFormatter(fmt)
+        logger.addHandler(handler)
+
 def log(msg: str) -> None:
-    print(msg)
+    logger.info(msg)
 
 # ── SPOTIFY ───────────────────────────────────────────────────────────────────
 
@@ -128,7 +167,8 @@ def load_or_create_session() -> tidalapi.Session:
             log(f"[tidal] Could not restore session ({e}), re-authenticating…")
 
     login, future = session.login_oauth()
-    log(f"[tidal] Open this URL in your browser to log in:\n  {login.verification_uri_complete}")
+    # Always print the login URL to screen regardless of log mode
+    print(f"[tidal] Open this URL in your browser to log in:\n  {login.verification_uri_complete}")
     future.result()
 
     SESSION_FILE.write_text(json.dumps({
@@ -170,7 +210,7 @@ def import_to_tidal(
     tracks: list[dict],
     tidal_playlist_id: str,
     dry_run: bool,
-) -> tuple[list[dict], str]:
+) -> tuple[list[dict], str, int, int]:
     playlist      = session.playlist(tidal_playlist_id)
     playlist_name = playlist.name
     existing_ids  = get_existing_tidal_ids(playlist)
@@ -180,7 +220,7 @@ def import_to_tidal(
     skipped      = 0
 
     # Spotify returns newest→oldest; reverse so oldest is inserted first,
-    # then each newer batch lands at position 0 — keeping newest on top.
+    # then each newer track lands at position 0 — keeping newest on top.
     reversed_tracks = list(reversed(tracks))
 
     for i, track in enumerate(reversed_tracks, 1):
@@ -198,7 +238,7 @@ def import_to_tidal(
             log(f"  [{i}/{len(reversed_tracks)}] ⏭  ALREADY IN PLAYLIST: {title} — {artist}")
             continue
 
-        existing_ids.add(result.id)  # prevent duplicates within this run
+        existing_ids.add(result.id)
         added_tracks.append(track)
         log(f"  [{i}/{len(reversed_tracks)}] {'🔎 [DRY-RUN]' if dry_run else '✅'} {title} — {artist}")
 
@@ -228,8 +268,8 @@ def send_telegram(added_tracks: list[dict], playlist_name: str, skipped: int, no
         return
 
     payload = json.dumps({
-        "chat_id": TELEGRAM_ID,
-        "text":    f"✅ _{playlist_name}_\nAdded {len(added_tracks)} new track(s). Skipped {skipped} already present, {not_found} not found on Tidal.",
+        "chat_id":    TELEGRAM_ID,
+        "text":       f"✅ _{playlist_name}_\nAdded {len(added_tracks)} new track(s). Skipped {skipped} already present, {not_found} not found on Tidal.",
         "parse_mode": "Markdown",
     }).encode()
 
@@ -250,6 +290,7 @@ def send_telegram(added_tracks: list[dict], playlist_name: str, skipped: int, no
 
 def main() -> None:
     args = parse_args()
+    setup_logging(args)
 
     if args.dry_run:
         log("🔎 DRY-RUN mode — no changes will be made to Tidal.\n")

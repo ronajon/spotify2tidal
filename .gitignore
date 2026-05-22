@@ -1,0 +1,6 @@
+/.cache
+/.env
+/.venv
+/.vscode
+/spotify2tidal.py.old
+/tidal_session.json

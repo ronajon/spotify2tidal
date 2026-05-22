@@ -5,6 +5,10 @@ Spotify playlist, then imports only NEW tracks into an existing Tidal playlist.
 
 ## Requirements:
 
+[Spotity Python library](https://github.com/spotipy-dev/spotipy)
+
+[Tidalapi](https://github.com/EbbLabs/python-tidal)
+
 ```bash
 pip install spotapi tidalapi pymongo redis websockets python-dotenv
 ```

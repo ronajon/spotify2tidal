@@ -4,7 +4,8 @@
 /.vscode
 /tidal_session.json
 /*.log
-/added_history.json
-/removed_tracks.json
-/not_matched.json
+/added_history*.json
+/removed_tracks*.json
+/not_matched*.json
 /__pycache__
+/dedupe_removed_*.json

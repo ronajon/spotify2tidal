@@ -13,7 +13,7 @@ The script handles the full flow: reading the Spotify playlist via SpotAPI (no S
 3. Skips tracks already in the playlist, and tracks you previously removed
 4. Adds new tracks to your playlist oldest first, so the newest ends up on top (TIDAL stacks additions)
 5. Records what it added; tracks you later delete from the playlist are never re-added
-6. Writes songs without a confident TIDAL match to `not_matched.json`
+6. Writes songs without a confident TIDAL match to `not_matched_<tidal_playlist_id>.json`
 7. Sends a Telegram notification with a summary (only when tracks were actually added)
 
 ---
@@ -69,6 +69,28 @@ python spotify2tidal.py <spotify_playlist_id> <tidal_playlist_id> --lognone
 
 ---
 
+## Removing doubles from a playlist
+
+`dedupe_tidal.py` finds songs that appear more than once in a TIDAL playlist (for example album vs single vs remaster) and removes the doubles, keeping the **oldest** one: the copy that was added to the playlist first.
+
+```bash
+# Report only (default): shows what would be kept and removed
+python dedupe_tidal.py <tidal_playlist_id>
+
+# Actually remove the doubles
+python dedupe_tidal.py <tidal_playlist_id> --apply
+
+# Keep live/remix versions apart (don't ignore bracketed text in titles)
+python dedupe_tidal.py <tidal_playlist_id> --strict
+```
+
+- Songs are the same when normalized title and primary artist are equal. By default bracketed text like `(Live)` or `(Remastered 2011)` is ignored; `--strict` keeps it
+- Oldest = earliest date added to the playlist. If TIDAL gives no dates, the lowest position counts as oldest (new tracks are added on top)
+- Without `--apply` nothing is changed. With `--apply` the removed tracks are first saved to `dedupe_removed_<tidal_playlist_id>_<time>.json`
+- The importer uses the same title-and-artist check, so it no longer adds a second version of a song that is already in the playlist
+
+---
+
 ## Telegram notifications
 
 When tracks are added, a message is sent to your Telegram bot:
@@ -88,9 +110,10 @@ Safe to run repeatedly. On each run:
 
 - Tracks already in the playlist are skipped (`⏭ ALREADY IN PLAYLIST`)
 - Only songs new on the Spotify playlist since the last run are added
-- Matching is strict (artist and title must both match, similarity ≥ 0.85). Songs without a confident match are not added; they are listed in `not_matched.json` with TIDAL's closest hit so you can add them manually
-- Everything the script adds is stored in `added_history.json`. If you delete such a track from the playlist, the next run detects that, moves it to `removed_tracks.json` and never re-adds it. Putting it back by hand clears it from that list
+- Matching is strict (artist and title must both match, similarity ≥ 0.85). Songs without a confident match are not added; they are listed in `not_matched_<tidal_playlist_id>.json` with TIDAL's closest hit so you can add them manually
+- Everything the script adds is stored in `added_history_<tidal_playlist_id>.json`. If you delete such a track from the playlist, the next run detects that, moves it to `removed_tracks_<tidal_playlist_id>.json` and never re-adds it. Putting it back by hand clears it from that list
 - The history starts at the first run with this version, so tracks deleted before that are not known as removed
+- State is kept per Tidal playlist (the ID is in the file name), so you can manage several playlists with the same script without them affecting each other
 - With `--dry-run` none of these files are written
 
 ---
@@ -118,13 +141,15 @@ At the top of `spotify2tidal.py`:
 | File | Description |
 |---|---|
 | `spotify2tidal.py` | Main script |
+| `dedupe_tidal.py` | Removes duplicate songs from a TIDAL playlist, keeping the oldest |
 | `requirements.txt` | Python dependencies |
 | `.env` | Your credentials — not committed |
 | `tidal_session.json` | Saved TIDAL OAuth session — not committed |
 | `spotify_to_tidal.log` | Run log, only with `--logtofile` |
-| `added_history.json` | Tracks the script has added (id, artist, title, date) |
-| `removed_tracks.json` | Tracks you removed from the playlist; never re-added |
-| `not_matched.json` | Tracks without a confident TIDAL match, plus closest hit |
+| `added_history_<tidal_playlist_id>.json` | Tracks the script has added (id, artist, title, date) |
+| `removed_tracks_<tidal_playlist_id>.json` | Tracks you removed from the playlist; never re-added |
+| `not_matched_<tidal_playlist_id>.json` | Tracks without a confident TIDAL match, plus closest hit |
+| `dedupe_removed_<tidal_playlist_id>_<time>.json` | Backup of tracks removed by `dedupe_tidal.py --apply` |
 
 ---
 
@@ -134,9 +159,10 @@ At the top of `spotify2tidal.py`:
 .env
 tidal_session.json
 *.log
-added_history.json
-removed_tracks.json
-not_matched.json
+added_history*.json
+removed_tracks*.json
+not_matched*.json
+dedupe_removed_*.json
 __pycache__/
 .venv/
 ```

@@ -26,6 +26,7 @@ from datetime import datetime
 from spotify2tidal import load_or_create_session, logger, song_key
 
 DATE_FMT = "%Y-%m-%d %H:%M"
+BATCH_SIZE = 20  # positions per delete request; one huge request can be rejected by Tidal
 
 
 def parse_args() -> argparse.Namespace:
@@ -129,12 +130,27 @@ def main() -> None:
         )
     print(f"Removed tracks saved to {backup}")
 
-    # One request with the original positions, so indices cannot shift mid-way.
-    if playlist.remove_by_indices(sorted(to_remove)):
-        print(f"✅ Removed {len(to_remove)} track(s).")
-    else:
-        print("❌ Tidal rejected the removal; nothing was changed.")
-        sys.exit(1)
+    # Small batches, highest positions first: removing a higher position never
+    # shifts a lower one, so the positions we computed stay valid. tidalapi
+    # re-reads the playlist (fresh ETag) after each successful batch.
+    removed = 0
+    ordered = sorted(to_remove, reverse=True)
+    for start in range(0, len(ordered), BATCH_SIZE):
+        batch = sorted(ordered[start:start + BATCH_SIZE])
+        try:
+            ok = playlist.remove_by_indices(batch)
+        except Exception as e:
+            # tidalapi can fail while parsing an empty error body; show the real response
+            resp = getattr(session.request, "latest_err_response", None)
+            detail = f"HTTP {resp.status_code} {resp.text[:200]!r}" if resp is not None else repr(e)
+            print(f"❌ Removal failed ({detail}). Removed {removed} of {len(to_remove)} so far.")
+            sys.exit(1)
+        if not ok:
+            print(f"❌ Tidal rejected the removal. Removed {removed} of {len(to_remove)} so far.")
+            sys.exit(1)
+        removed += len(batch)
+        print(f"  removed {removed}/{len(to_remove)}")
+    print(f"✅ Removed {removed} track(s).")
 
 
 if __name__ == "__main__":

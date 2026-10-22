@@ -4,16 +4,22 @@ Spotify Playlist Scraper → Tidal Importer
 Uses SpotAPI (no Selenium, no API key) to fetch all tracks from a public
 Spotify playlist, then imports only NEW tracks into an existing Tidal playlist.
 
+Matching is strict: artist and title must both match. Tracks without a
+confident match are listed in not_matched.json (with Tidal's closest hit).
+Everything the script adds is recorded in added_history.json; if such a track
+later disappears from the Tidal playlist it is moved to removed_tracks.json
+and never re-added.
+
 Requirements:
-    pip install spotapi tidalapi pymongo redis websockets python-dotenv
+    pip install -r requirements.txt
 
 .env file:
     TELEGRAM_TOKEN=your_bot_token
     TELEGRAM_ID=your_chat_id
 
 Usage:
-    python spotify_to_tidal.py <spotify_playlist_id> <tidal_playlist_id> [--dry-run]
-                               [--logtoscreen | --logtofile | --lognone]
+    python spotify2tidal.py <spotify_playlist_id> <tidal_playlist_id> [--dry-run]
+                            [--logtoscreen | --logtofile | --lognone]
 """
 
 import argparse
@@ -21,10 +27,14 @@ import json
 import logging
 import os
 import pathlib
+import re
 import sys
 import time
+import unicodedata
 import urllib.error
 import urllib.request
+from datetime import datetime
+from difflib import SequenceMatcher
 
 import tidalapi
 from dotenv import load_dotenv
@@ -38,6 +48,15 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_ID    = os.getenv("TELEGRAM_ID", "")
 SESSION_FILE   = pathlib.Path("tidal_session.json")
 LOG_FILE       = pathlib.Path("spotify_to_tidal.log")
+# State files (JSON). History = everything this script ever added; removed =
+# tracks that were in history but later disappeared from the playlist (deleted
+# by you) and are never re-added; not_matched = tracks without a confident
+# Tidal match, for manual follow-up.
+HISTORY_FILE     = pathlib.Path("added_history.json")
+REMOVED_FILE     = pathlib.Path("removed_tracks.json")
+NOT_MATCHED_FILE = pathlib.Path("not_matched.json")
+# Minimum similarity (0-1) for artist / title to count as a match
+MATCH_THRESHOLD  = 0.85
 
 # ── ARGS ──────────────────────────────────────────────────────────────────────
 
@@ -63,8 +82,7 @@ def parse_args() -> argparse.Namespace:
     log_group.add_argument(
         "--logtoscreen",
         action="store_true",
-        default=True,
-        help="Print log output to the screen (default).",
+        help="Print log output to the screen (default when no other log option is given).",
     )
     log_group.add_argument(
         "--logtofile",
@@ -137,7 +155,8 @@ def scrape_spotify(playlist_id: str) -> list[dict]:
 
                 tracks.append({"title": title, "artist": artists, "album": album, "year": year})
 
-            except Exception:
+            except Exception as e:
+                log(f"  ⚠️  Could not parse Spotify item ({e}) — skipping")
                 continue
 
         log(f"  fetched {len(tracks)} tracks so far...")
@@ -177,32 +196,96 @@ def load_or_create_session() -> tidalapi.Session:
         "refresh_token": session.refresh_token,
         "expiry_time":   session.expiry_time.isoformat() if session.expiry_time else None,
     }))
+    try:
+        SESSION_FILE.chmod(0o600)  # tokens are stored in plain text
+    except OSError:
+        pass
     log(f"[tidal] Session saved to {SESSION_FILE}")
     return session
 
 # ── TIDAL IMPORT ──────────────────────────────────────────────────────────────
 
-def get_existing_tidal_ids(playlist: tidalapi.Playlist) -> set[int]:
-    log("📋 Fetching existing tracks from Tidal playlist...")
-    ids = {track.id for track in playlist.tracks()}
-    log(f"   {len(ids)} tracks already in playlist.")
-    return ids
+def normalize(text: str) -> str:
+    """Lowercase, strip accents, bracketed parts, remaster/live suffixes and punctuation."""
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(c for c in text if not unicodedata.combining(c)).lower()
+    stripped = re.sub(r"\s*[\(\[].*?[\)\]]", "", text)
+    stripped = re.sub(r"\s-\s.*(remaster|live|version|mix|edit|mono|stereo).*$", "", stripped)
+    if stripped.strip():
+        text = stripped
+    text = text.replace("&", " and ")
+    text = re.sub(r"[^\w\s]", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def similar(a: str, b: str) -> float:
+    return SequenceMatcher(None, a, b).ratio()
+
+
+def track_artist_names(track) -> list[str]:
+    artists = getattr(track, "artists", None) or ([track.artist] if track.artist else [])
+    return [normalize(a.name) for a in artists if a and a.name]
+
+
+def artist_matches(spotify_artist: str, track) -> bool:
+    tidal_names = track_artist_names(track)
+    if not tidal_names:
+        return False
+    # Spotify joins multiple artists with ", "; accept a match on any single one
+    # as well as on the full combined string.
+    sp_names = [normalize(a) for a in spotify_artist.split(", ") if a.strip()]
+    parts = [normalize(spotify_artist)] + sp_names
+    candidates = tidal_names + [" and ".join(tidal_names)]
+    return any(similar(p, c) >= MATCH_THRESHOLD for p in parts for c in candidates)
+
+
+def title_matches(spotify_title: str, track) -> bool:
+    return similar(normalize(spotify_title), normalize(track.name)) >= MATCH_THRESHOLD
 
 
 def find_tidal_track(session: tidalapi.Session, title: str, artist: str):
-    query = f"{title} {artist}"
+    """
+    Return (match, closest). `match` is a Tidal track only when both artist and
+    title match confidently, otherwise None. `closest` is the first search hit
+    (or None) so it can be suggested for manual follow-up.
+    """
     try:
-        results = session.search(query, models=[tidalapi.Track])
-        for track in results.get("tracks", []):
-            t_title  = track.name.lower()
-            t_artist = track.artist.name.lower() if track.artist else ""
-            if title.lower() in t_title or t_title in title.lower():
-                if any(word in t_artist for word in artist.lower().split()):
-                    return track
-        tracks = results.get("tracks", [])
-        return tracks[0] if tracks else None
-    except Exception:
-        return None
+        results = session.search(f"{title} {artist}", models=[tidalapi.Track], limit=10)
+    except Exception as e:
+        log(f"  ⚠️  Tidal search failed for {title} — {artist}: {e}")
+        return None, None
+
+    tracks = results.get("tracks", [])
+    if not tracks:
+        return None, None
+
+    for track in tracks:
+        if artist_matches(artist, track) and title_matches(title, track):
+            return track, tracks[0]
+    return None, tracks[0]
+
+
+def load_json(path: pathlib.Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as e:
+        log(f"[state] Could not read {path} ({e}) — starting empty")
+        return {}
+
+
+def save_json(path: pathlib.Path, data: dict) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(path)
+
+
+def get_existing_tidal_ids(playlist: tidalapi.Playlist) -> set[int]:
+    log("📋 Fetching existing tracks from Tidal playlist...")
+    ids = {track.id for track in playlist.tracks_paginated()}
+    log(f"   {len(ids)} tracks already in playlist.")
+    return ids
 
 
 def import_to_tidal(
@@ -215,6 +298,24 @@ def import_to_tidal(
     playlist_name = playlist.name
     existing_ids  = get_existing_tidal_ids(playlist)
 
+    history     = load_json(HISTORY_FILE)
+    removed     = load_json(REMOVED_FILE)
+    not_matched = load_json(NOT_MATCHED_FILE)
+    today       = datetime.now().strftime("%Y-%m-%d")
+    current_ids = {str(i) for i in existing_ids}
+
+    # Tracks you put back in the playlist yourself are no longer "removed"
+    for tid in [t for t in removed if t in current_ids]:
+        log(f"[history] Back in playlist, no longer treated as removed: "
+            f"{removed[tid].get('artist')} — {removed[tid].get('title')}")
+        del removed[tid]
+    # Tracks this script added earlier that are now gone were removed by you
+    for tid, info in history.items():
+        if tid not in current_ids and tid not in removed:
+            removed[tid] = {**info, "removed_detected": today}
+            log(f"[history] Removed by you, will not be re-added: "
+                f"{info.get('artist')} — {info.get('title')} (id={tid})")
+
     added_tracks = []
     not_found    = []
     skipped      = 0
@@ -223,38 +324,69 @@ def import_to_tidal(
     # then each newer track lands at position 0 — keeping newest on top.
     reversed_tracks = list(reversed(tracks))
 
-    for i, track in enumerate(reversed_tracks, 1):
-        title  = track["title"]
-        artist = track["artist"]
-        result = find_tidal_track(session, title, artist)
+    try:
+        for i, track in enumerate(reversed_tracks, 1):
+            title  = track["title"]
+            artist = track["artist"]
+            key    = f"{artist} — {title}"
+            result, closest = find_tidal_track(session, title, artist)
 
-        if result is None:
-            not_found.append(track)
-            log(f"  [{i}/{len(reversed_tracks)}] ❌ NOT FOUND: {title} — {artist}")
-            continue
+            if result is None:
+                not_found.append(track)
+                log(f"  [{i}/{len(reversed_tracks)}] ❌ NO CONFIDENT MATCH: {title} — {artist}")
+                not_matched[key] = {
+                    "artist": artist,
+                    "title":  title,
+                    "first_seen": not_matched.get(key, {}).get("first_seen", today),
+                    "closest_tidal_hit": {
+                        "artist": closest.artist.name if closest.artist else None,
+                        "title":  closest.name,
+                        "id":     closest.id,
+                    } if closest else None,
+                }
+                continue
 
-        if result.id in existing_ids:
-            skipped += 1
-            log(f"  [{i}/{len(reversed_tracks)}] ⏭  ALREADY IN PLAYLIST: {title} — {artist}")
-            continue
+            not_matched.pop(key, None)
 
-        existing_ids.add(result.id)
-        added_tracks.append(track)
-        log(f"  [{i}/{len(reversed_tracks)}] {'🔎 [DRY-RUN]' if dry_run else '✅'} {title} — {artist}")
+            if str(result.id) in removed:
+                skipped += 1
+                log(f"  [{i}/{len(reversed_tracks)}] ⊘ PREVIOUSLY REMOVED BY YOU: {title} — {artist}")
+                continue
 
+            if result.id in existing_ids:
+                skipped += 1
+                log(f"  [{i}/{len(reversed_tracks)}] ⏭  ALREADY IN PLAYLIST: {title} — {artist}")
+                continue
+
+            existing_ids.add(result.id)
+            added_tracks.append(track)
+            log(f"  [{i}/{len(reversed_tracks)}] {'🔎 [DRY-RUN]' if dry_run else '✅'} {title} — {artist}")
+
+            if not dry_run:
+                playlist.add([result.id], allow_duplicates=True, position=0)
+                history[str(result.id)] = {
+                    "artist": result.artist.name if result.artist else artist,
+                    "title":  result.name,
+                    "spotify": key,
+                    "added_on": today,
+                }
+                time.sleep(0.1)
+    finally:
         if not dry_run:
-            playlist.add([result.id], allow_duplicates=True, position=0)
-            time.sleep(0.1)
+            save_json(HISTORY_FILE, history)
+            save_json(REMOVED_FILE, removed)
+            save_json(NOT_MATCHED_FILE, not_matched)
+            log(f"[state] Saved {HISTORY_FILE}, {REMOVED_FILE}, {NOT_MATCHED_FILE}")
 
     label = "Would add" if dry_run else "Added"
     log(f"\n✅ Done! {label} {len(added_tracks)} new track(s). "
-        f"Skipped {skipped} already present, {len(not_found)} not found on Tidal.")
+        f"Skipped {skipped} already present or removed, {len(not_found)} without a confident match.")
 
     if dry_run:
         log("[dry-run] No changes were made to the Tidal playlist.")
 
     if not_found:
-        log("\n⚠️  Tracks not found on Tidal:")
+        log(f"\n⚠️  Tracks without a confident Tidal match (see {NOT_MATCHED_FILE}):")
         for t in not_found:
             log(f"    - {t['title']} — {t['artist']}")
 
@@ -269,7 +401,7 @@ def send_telegram(added_tracks: list[dict], playlist_name: str, skipped: int, no
 
     payload = json.dumps({
         "chat_id":    TELEGRAM_ID,
-        "text":       f"✅ _{playlist_name}_\nAdded {len(added_tracks)} new track(s). Skipped {skipped} already present, {not_found} not found on Tidal.",
+        "text":       f"✅ _{playlist_name}_\nAdded {len(added_tracks)} new track(s). Skipped {skipped} already present, {not_found} without a confident match.",
         "parse_mode": "Markdown",
     }).encode()
 

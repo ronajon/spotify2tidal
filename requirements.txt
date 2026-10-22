@@ -1,0 +1,3 @@
+spotapi
+tidalapi
+python-dotenv
